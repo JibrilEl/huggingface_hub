@@ -1,5 +1,6 @@
 import json
 import os
+import struct
 import unittest
 from pathlib import Path
 from typing import TypeVar
@@ -8,29 +9,18 @@ from unittest.mock import Mock, patch
 import pytest
 
 from huggingface_hub import HfApi, hf_hub_download
-from huggingface_hub.hub_mixin import PyTorchModelHubMixin
-from huggingface_hub.utils import SoftTemporaryDirectory, is_torch_available
+from huggingface_hub.constants import PYTORCH_WEIGHTS_NAME
+from huggingface_hub.hub_mixin import ModelHubMixin, PyTorchModelHubMixin
+from huggingface_hub.utils import EntryNotFoundError, HfHubHTTPError, SoftTemporaryDirectory, is_torch_available
 
 from .testing_constants import ENDPOINT_STAGING, TOKEN, USER
-from .testing_utils import repo_name
+from .testing_utils import repo_name, requires
 
 
 if is_torch_available():
+    import torch
     import torch.nn as nn
 
-
-def require_torch(test_case):
-    """
-    Decorator marking a test that requires PyTorch.
-    These tests are skipped when PyTorch isn't installed.
-    """
-    if not is_torch_available():
-        return unittest.skip("test requires PyTorch")(test_case)
-    else:
-        return test_case
-
-
-if is_torch_available():
     CONFIG = {"num": 10, "act": "gelu_fast"}
 
     class DummyModel(nn.Module, PyTorchModelHubMixin):
@@ -46,9 +36,9 @@ else:
     DummyModel = None
 
 
-@require_torch
+@requires("torch")
 @pytest.mark.usefixtures("fx_cache_dir")
-class HubMixingTest(unittest.TestCase):
+class PytorchHubMixinTest(unittest.TestCase):
     cache_dir: Path
 
     @classmethod
@@ -61,15 +51,25 @@ class HubMixingTest(unittest.TestCase):
     def test_save_pretrained_basic(self):
         DummyModel().save_pretrained(self.cache_dir)
         files = os.listdir(self.cache_dir)
-        self.assertTrue("pytorch_model.bin" in files)
+        self.assertTrue("model.safetensors" in files)
         self.assertEqual(len(files), 1)
 
     def test_save_pretrained_with_config(self):
         DummyModel().save_pretrained(self.cache_dir, config=CONFIG)
         files = os.listdir(self.cache_dir)
         self.assertTrue("config.json" in files)
-        self.assertTrue("pytorch_model.bin" in files)
+        self.assertTrue("model.safetensors" in files)
         self.assertEqual(len(files), 2)
+
+    def test_save_as_safetensors(self):
+        DummyModel().save_pretrained(self.cache_dir, config=TOKEN)
+        modelFile = self.cache_dir / "model.safetensors"
+        # check for safetensors header to ensure we are saving the model in safetensors format
+        # while an implementation detail, assert as this has safety implications
+        # https://github.com/huggingface/safetensors?tab=readme-ov-file#format
+        with open(modelFile, "rb") as f:
+            header_size = struct.unpack("<Q", f.read(8))[0]
+            self.assertEqual(header_size, 128)
 
     def test_save_pretrained_with_push_to_hub(self):
         repo_id = repo_name("save")
@@ -97,6 +97,69 @@ class HubMixingTest(unittest.TestCase):
         model = DummyModel.from_pretrained("namespace/repo_name")
         from_pretrained_mock.assert_called_once()
         self.assertIs(model, from_pretrained_mock.return_value)
+
+    def pretend_file_download(self, **kwargs):
+        if kwargs.get("filename") == "config.json":
+            raise HfHubHTTPError("no config")
+        DummyModel().save_pretrained(self.cache_dir)
+        return self.cache_dir / "model.safetensors"
+
+    @patch("huggingface_hub.hub_mixin.hf_hub_download")
+    def test_from_pretrained_model_from_hub_prefer_safetensor(self, hf_hub_download_mock: Mock) -> None:
+        hf_hub_download_mock.side_effect = self.pretend_file_download
+        model = DummyModel.from_pretrained("namespace/repo_name")
+        hf_hub_download_mock.assert_any_call(
+            repo_id="namespace/repo_name",
+            filename="model.safetensors",
+            revision=None,
+            cache_dir=None,
+            force_download=False,
+            proxies=None,
+            resume_download=False,
+            token=None,
+            local_files_only=False,
+        )
+        self.assertIsNotNone(model)
+
+    def pretend_file_download_fallback(self, **kwargs):
+        filename = kwargs.get("filename")
+        if filename == "model.safetensors" or filename == "config.json":
+            raise EntryNotFoundError("not found")
+
+        class TestMixin(ModelHubMixin):
+            def _save_pretrained(self, save_directory: Path) -> None:
+                torch.save(DummyModel().state_dict(), save_directory / PYTORCH_WEIGHTS_NAME)
+
+        TestMixin().save_pretrained(self.cache_dir)
+        return self.cache_dir / PYTORCH_WEIGHTS_NAME
+
+    @patch("huggingface_hub.hub_mixin.hf_hub_download")
+    def test_from_pretrained_model_from_hub_fallback_pickle(self, hf_hub_download_mock: Mock) -> None:
+        hf_hub_download_mock.side_effect = self.pretend_file_download_fallback
+        model = DummyModel.from_pretrained("namespace/repo_name")
+        hf_hub_download_mock.assert_any_call(
+            repo_id="namespace/repo_name",
+            filename="model.safetensors",
+            revision=None,
+            cache_dir=None,
+            force_download=False,
+            proxies=None,
+            resume_download=False,
+            token=None,
+            local_files_only=False,
+        )
+        hf_hub_download_mock.assert_any_call(
+            repo_id="namespace/repo_name",
+            filename="pytorch_model.bin",
+            revision=None,
+            cache_dir=None,
+            force_download=False,
+            proxies=None,
+            resume_download=False,
+            token=None,
+            local_files_only=False,
+        )
+        self.assertIsNotNone(model)
 
     @patch.object(DummyModel, "_from_pretrained")
     def test_from_pretrained_model_id_and_revision(self, from_pretrained_mock: Mock) -> None:
@@ -153,7 +216,7 @@ class HubMixingTest(unittest.TestCase):
 
     def test_push_to_hub(self):
         repo_id = f"{USER}/{repo_name('push_to_hub')}"
-        DummyModel().push_to_hub(repo_id=repo_id, api_endpoint=ENDPOINT_STAGING, token=TOKEN, config=CONFIG)
+        DummyModel().push_to_hub(repo_id=repo_id, token=TOKEN, config=CONFIG)
 
         # Test model id exists
         model_info = self._api.model_info(repo_id)

@@ -20,7 +20,7 @@ import re
 import struct
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from functools import wraps
 from itertools import islice
@@ -36,12 +36,11 @@ from typing import (
     Literal,
     Optional,
     Tuple,
-    TypedDict,
     TypeVar,
     Union,
     overload,
 )
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 
 import requests
 from requests.exceptions import HTTPError
@@ -53,7 +52,7 @@ from ._commit_api import (
     CommitOperationAdd,
     CommitOperationCopy,
     CommitOperationDelete,
-    _fetch_lfs_files_to_copy,
+    _fetch_files_to_copy,
     _fetch_upload_modes,
     _prepare_commit_payload,
     _upload_lfs_files,
@@ -130,6 +129,7 @@ from .utils import (  # noqa: F401 # imported for backward compatibility
     validate_hf_hub_args,
 )
 from .utils import tqdm as hf_tqdm
+from .utils._deprecation import _deprecate_arguments, _deprecate_method
 from .utils._typing import CallableT
 from .utils.endpoint_helpers import (
     DatasetFilter,
@@ -237,42 +237,64 @@ def repo_type_and_id_from_hf_id(hf_id: str, hub_url: Optional[str] = None) -> Tu
     return repo_type, namespace, repo_id
 
 
-class LastCommitInfo(TypedDict, total=False):
+@dataclass
+class LastCommitInfo(dict):
     oid: str
     title: str
     date: datetime
 
+    def __post_init__(self):  # hack to make LastCommitInfo backward compatible
+        self.update(asdict(self))
 
-class BlobLfsInfo(TypedDict, total=False):
+
+@dataclass
+class BlobLfsInfo(dict):
     size: int
     sha256: str
     pointer_size: int
 
+    def __post_init__(self):  # hack to make BlobLfsInfo backward compatible
+        self.update(asdict(self))
 
-class BlobSecurityInfo(TypedDict, total=False):
+
+@dataclass
+class BlobSecurityInfo(dict):
     safe: bool
     av_scan: Optional[Dict]
     pickle_import_scan: Optional[Dict]
 
-
-class TransformersInfo(TypedDict, total=False):
-    auto_model: str
-    custom_class: Optional[str]
-    # possible `pipeline_tag` values: https://github.com/huggingface/huggingface.js/blob/3ee32554b8620644a6287e786b2a83bf5caf559c/packages/tasks/src/pipelines.ts#L72
-    pipeline_tag: Optional[str]
-    processor: Optional[str]
-
-
-class SafeTensorsInfo(TypedDict, total=False):
-    parameters: List[Dict[str, int]]
-    total: int
+    def __post_init__(self):  # hack to make BlogSecurityInfo backward compatible
+        self.update(asdict(self))
 
 
 @dataclass
-class CommitInfo:
+class TransformersInfo(dict):
+    auto_model: str
+    custom_class: Optional[str] = None
+    # possible `pipeline_tag` values: https://github.com/huggingface/huggingface.js/blob/3ee32554b8620644a6287e786b2a83bf5caf559c/packages/tasks/src/pipelines.ts#L72
+    pipeline_tag: Optional[str] = None
+    processor: Optional[str] = None
+
+    def __post_init__(self):  # hack to make TransformersInfo backward compatible
+        self.update(asdict(self))
+
+
+@dataclass
+class SafeTensorsInfo(dict):
+    parameters: List[Dict[str, int]]
+    total: int
+
+    def __post_init__(self):  # hack to make SafeTensorsInfo backward compatible
+        self.update(asdict(self))
+
+
+@dataclass
+class CommitInfo(str):
     """Data structure containing information about a newly created commit.
 
-    Returned by [`create_commit`].
+    Returned by any method that creates a commit on the Hub: [`create_commit`], [`upload_file`], [`upload_folder`],
+    [`delete_file`], [`delete_folder`]. It inherits from `str` for backward compatibility but using methods specific
+    to `str` is deprecated.
 
     Attributes:
         commit_url (`str`):
@@ -299,6 +321,12 @@ class CommitInfo:
             Number of the PR discussion that has been created, if any. Populated when
             `create_pr=True` is passed. Can be passed as `discussion_num` in
             [`get_discussion_details`]. Example: `1`.
+
+        _url (`str`, *optional*):
+            Legacy url for `str` compatibility. Can be the url to the uploaded file on the Hub (if returned by
+            [`upload_file`]), to the uploaded folder on the Hub (if returned by [`upload_folder`]) or to the commit on
+            the Hub (if returned by [`create_commit`]). Defaults to `commit_url`. It is deprecated to use this
+            attribute. Please use `commit_url` instead.
     """
 
     commit_url: str
@@ -311,6 +339,12 @@ class CommitInfo:
     pr_revision: Optional[str] = field(init=False)
     pr_num: Optional[str] = field(init=False)
 
+    # legacy url for `str` compatibility (ex: url to uploaded file, url to uploaded folder, url to PR, etc.)
+    _url: str = field(repr=False, default=None)  # type: ignore  # defaults to `commit_url`
+
+    def __new__(cls, *args, commit_url: str, _url: Optional[str] = None, **kwargs):
+        return str.__new__(cls, _url or commit_url)
+
     def __post_init__(self):
         """Populate pr-related fields after initialization.
 
@@ -322,6 +356,35 @@ class CommitInfo:
         else:
             self.pr_revision = None
             self.pr_num = None
+
+
+@dataclass
+class AccessRequest:
+    """Data structure containing information about a user access request.
+
+    Attributes:
+        username (`str`):
+            Username of the user who requested access.
+        fullname (`str`):
+            Fullname of the user who requested access.
+        email (`str`):
+            Email of the user who requested access.
+        timestamp (`datetime`):
+            Timestamp of the request.
+        status (`Literal["pending", "accepted", "rejected"]`):
+            Status of the request. Can be one of `["pending", "accepted", "rejected"]`.
+        fields (`Dict[str, Any]`, *optional*):
+            Additional fields filled by the user in the gate form.
+    """
+
+    username: str
+    fullname: str
+    email: str
+    timestamp: datetime
+    status: Literal["pending", "accepted", "rejected"]
+
+    # Additional fields filled by the user in the gate form
+    fields: Optional[Dict[str, Any]] = None
 
 
 class RepoUrl(str):
@@ -612,7 +675,7 @@ class ModelInfo:
             ModelCardData(**card_data, ignore_metadata_errors=True) if isinstance(card_data, dict) else card_data
         )
 
-        self.widget_data = kwargs.pop("widget_data", None)
+        self.widget_data = kwargs.pop("widgetData", None)
         self.model_index = kwargs.pop("model-index", None) or kwargs.pop("model_index", None)
         self.config = kwargs.pop("config", None)
         transformers_info = kwargs.pop("transformersInfo", None) or kwargs.pop("transformers_info", None)
@@ -1050,7 +1113,7 @@ class GitRefs:
     branches: List[GitRefInfo]
     converts: List[GitRefInfo]
     tags: List[GitRefInfo]
-    pull_requests: Optional[List[GitRefInfo]]
+    pull_requests: Optional[List[GitRefInfo]] = None
 
 
 @dataclass
@@ -1317,6 +1380,12 @@ class HfApi:
         *,
         filter: Union[ModelFilter, str, Iterable[str], None] = None,
         author: Optional[str] = None,
+        library: Optional[Union[str, List[str]]] = None,
+        language: Optional[Union[str, List[str]]] = None,
+        model_name: Optional[str] = None,
+        task: Optional[Union[str, List[str]]] = None,
+        trained_dataset: Optional[Union[str, List[str]]] = None,
+        tags: Optional[Union[str, List[str]]] = None,
         search: Optional[str] = None,
         emissions_thresholds: Optional[Tuple[float, float]] = None,
         sort: Union[Literal["last_modified"], str, None] = None,
@@ -1326,6 +1395,7 @@ class HfApi:
         cardData: bool = False,
         fetch_config: bool = False,
         token: Optional[Union[bool, str]] = None,
+        pipeline_tag: Optional[str] = None,
     ) -> Iterable[ModelInfo]:
         """
         List models hosted on the Huggingface Hub, given some filters.
@@ -1337,6 +1407,24 @@ class HfApi:
             author (`str`, *optional*):
                 A string which identify the author (user or organization) of the
                 returned models
+            library (`str` or `List`, *optional*):
+                A string or list of strings of foundational libraries models were
+                originally trained from, such as pytorch, tensorflow, or allennlp.
+            language (`str` or `List`, *optional*):
+                A string or list of strings of languages, both by name and country
+                code, such as "en" or "English"
+            model_name (`str`, *optional*):
+                A string that contain complete or partial names for models on the
+                Hub, such as "bert" or "bert-base-cased"
+            task (`str` or `List`, *optional*):
+                A string or list of strings of tasks models were designed for, such
+                as: "fill-mask" or "automatic-speech-recognition"
+            trained_dataset (`str` or `List`, *optional*):
+                A string tag or a list of string tags of the trained dataset for a
+                model on the Hub.
+            tags (`str` or `List`, *optional*):
+                A string tag or a list of tags to filter models on the Hub by, such
+                as `text-generation` or `spacy`.
             search (`str`, *optional*):
                 A string that will be contained in the returned model ids.
             emissions_thresholds (`Tuple`, *optional*):
@@ -1367,6 +1455,9 @@ class HfApi:
                 If `None` or `True` and machine is logged in (through `huggingface-cli login`
                 or [`~huggingface_hub.login`]), token will be retrieved from the cache.
                 If `False`, token is not sent in the request header.
+            pipeline_tag (`str`, *optional*):
+                A string pipeline tag to filter models on the Hub by, such as `summarization`
+
 
         Returns:
             `Iterable[ModelInfo]`: an iterable of [`huggingface_hub.hf_api.ModelInfo`] objects.
@@ -1383,9 +1474,6 @@ class HfApi:
 
         >>> # List only the text classification models
         >>> api.list_models(filter="text-classification")
-        >>> # Using the `ModelFilter`
-        >>> filt = ModelFilter(task="text-classification")
-
 
         >>> # List only models from the AllenNLP library
         >>> api.list_models(filter="allennlp")
@@ -1411,15 +1499,38 @@ class HfApi:
         path = f"{self.endpoint}/api/models"
         headers = self._build_hf_headers(token=token)
         params = {}
+        filter_list = []
+
         if filter is not None:
             if isinstance(filter, ModelFilter):
                 params = self._unpack_model_filter(filter)
             else:
                 params.update({"filter": filter})
+
             params.update({"full": True})
-        if author is not None:
+
+        # Build the filter list
+        if author:
             params.update({"author": author})
-        if search is not None:
+        if model_name:
+            params.update({"search": model_name})
+        if library:
+            filter_list.extend([library] if isinstance(library, str) else library)
+        if task:
+            filter_list.extend([task] if isinstance(task, str) else task)
+        if trained_dataset:
+            if not isinstance(trained_dataset, (list, tuple)):
+                trained_dataset = [trained_dataset]
+            for dataset in trained_dataset:
+                if not dataset.startswith("dataset:"):
+                    dataset = f"dataset:{dataset}"
+                filter_list.append(dataset)
+        if language:
+            filter_list.extend([language] if isinstance(language, str) else language)
+        if tags:
+            filter_list.extend([tags] if isinstance(tags, str) else tags)
+
+        if search:
             params.update({"search": search})
         if sort is not None:
             params.update({"sort": "lastModified" if sort == "last_modified" else sort})
@@ -1436,6 +1547,13 @@ class HfApi:
             params.update({"config": True})
         if cardData:
             params.update({"cardData": True})
+        if pipeline_tag:
+            params.update({"pipeline_tag": pipeline_tag})
+
+        filter_value = params.get("filter", [])
+        if filter_value:
+            filter_list.extend([filter_value] if isinstance(filter_value, str) else list(filter_value))
+        params.update({"filter": filter_list})
 
         # `items` is a generator
         items = paginate(path, params=params, headers=headers)
@@ -1455,21 +1573,21 @@ class HfApi:
         model_str = ""
 
         # Handling author
-        if model_filter.author is not None:
+        if model_filter.author:
             model_str = f"{model_filter.author}/"
 
         # Handling model_name
-        if model_filter.model_name is not None:
+        if model_filter.model_name:
             model_str += model_filter.model_name
 
         filter_list: List[str] = []
 
         # Handling tasks
-        if model_filter.task is not None:
+        if model_filter.task:
             filter_list.extend([model_filter.task] if isinstance(model_filter.task, str) else model_filter.task)
 
         # Handling dataset
-        if model_filter.trained_dataset is not None:
+        if model_filter.trained_dataset:
             if not isinstance(model_filter.trained_dataset, (list, tuple)):
                 model_filter.trained_dataset = [model_filter.trained_dataset]
             for dataset in model_filter.trained_dataset:
@@ -1488,7 +1606,7 @@ class HfApi:
             filter_list.extend([model_filter.tags] if isinstance(model_filter.tags, str) else model_filter.tags)
 
         query_dict: Dict[str, Any] = {}
-        if model_str is not None:
+        if model_str:
             query_dict["search"] = model_str
         if isinstance(model_filter.language, list):
             filter_list.extend(model_filter.language)
@@ -1503,8 +1621,16 @@ class HfApi:
         *,
         filter: Union[DatasetFilter, str, Iterable[str], None] = None,
         author: Optional[str] = None,
+        benchmark: Optional[Union[str, List[str]]] = None,
+        dataset_name: Optional[str] = None,
+        language_creators: Optional[Union[str, List[str]]] = None,
+        language: Optional[Union[str, List[str]]] = None,
+        multilinguality: Optional[Union[str, List[str]]] = None,
+        size_categories: Optional[Union[str, List[str]]] = None,
+        task_categories: Optional[Union[str, List[str]]] = None,
+        task_ids: Optional[Union[str, List[str]]] = None,
         search: Optional[str] = None,
-        sort: Union[Literal["last_modified"], str, None] = None,
+        sort: Optional[Union[Literal["last_modified"], str]] = None,
         direction: Optional[Literal[-1]] = None,
         limit: Optional[int] = None,
         full: Optional[bool] = None,
@@ -1519,6 +1645,34 @@ class HfApi:
                 datasets on the hub.
             author (`str`, *optional*):
                 A string which identify the author of the returned datasets.
+            benchmark (`str` or `List`, *optional*):
+                A string or list of strings that can be used to identify datasets on
+                the Hub by their official benchmark.
+            dataset_name (`str`, *optional*):
+                A string or list of strings that can be used to identify datasets on
+                the Hub by its name, such as `SQAC` or `wikineural`
+            language_creators (`str` or `List`, *optional*):
+                A string or list of strings that can be used to identify datasets on
+                the Hub with how the data was curated, such as `crowdsourced` or
+                `machine_generated`.
+            language (`str` or `List`, *optional*):
+                A string or list of strings representing a two-character language to
+                filter datasets by on the Hub.
+            multilinguality (`str` or `List`, *optional*):
+                A string or list of strings representing a filter for datasets that
+                contain multiple languages.
+            size_categories (`str` or `List`, *optional*):
+                A string or list of strings that can be used to identify datasets on
+                the Hub by the size of the dataset such as `100K<n<1M` or
+                `1M<n<10M`.
+            task_categories (`str` or `List`, *optional*):
+                A string or list of strings that can be used to identify datasets on
+                the Hub by the designed task, such as `audio_classification` or
+                `named_entity_recognition`.
+            task_ids (`str` or `List`, *optional*):
+                A string or list of strings that can be used to identify datasets on
+                the Hub by the specific task such as `speech_emotion_recognition` or
+                `paraphrase`.
             search (`str`, *optional*):
                 A string that will be contained in the returned datasets.
             sort (`Literal["last_modified"]` or `str`, *optional*):
@@ -1556,16 +1710,12 @@ class HfApi:
 
         >>> # List only the text classification datasets
         >>> api.list_datasets(filter="task_categories:text-classification")
-        >>> # Using the `DatasetFilter`
-        >>> filt = DatasetFilter(task_categories="text-classification")
 
 
         >>> # List only the datasets in russian for language modeling
         >>> api.list_datasets(
         ...     filter=("language:ru", "task_ids:language-modeling")
         ... )
-        >>> # Using the `DatasetFilter`
-        >>> filt = DatasetFilter(language="ru", task_ids="language-modeling")
 
         >>> api.list_datasets(filter=filt)
         ```
@@ -1587,14 +1737,38 @@ class HfApi:
         path = f"{self.endpoint}/api/datasets"
         headers = self._build_hf_headers(token=token)
         params = {}
+        filter_list = []
+
         if filter is not None:
             if isinstance(filter, DatasetFilter):
                 params = self._unpack_dataset_filter(filter)
             else:
                 params.update({"filter": filter})
-        if author is not None:
+
+        # Build the filter list
+        if author:
             params.update({"author": author})
-        if search is not None:
+        if dataset_name:
+            params.update({"search": dataset_name})
+
+        for attr in (
+            benchmark,
+            language_creators,
+            language,
+            multilinguality,
+            size_categories,
+            task_categories,
+            task_ids,
+        ):
+            if attr:
+                if not isinstance(attr, (list, tuple)):
+                    attr = [attr]
+                for data in attr:
+                    if not data.startswith(f"{attr}:"):
+                        data = f"{attr}:{data}"
+                    filter_list.append(data)
+
+        if search:
             params.update({"search": search})
         if sort is not None:
             params.update({"sort": "lastModified" if sort == "last_modified" else sort})
@@ -1604,6 +1778,11 @@ class HfApi:
             params.update({"limit": limit})
         if full:
             params.update({"full": True})
+
+        filter_value = params.get("filter", [])
+        if filter_value:
+            filter_list.extend([filter_value] if isinstance(filter_value, str) else list(filter_value))
+        params.update({"filter": filter_list})
 
         items = paginate(path, params=params, headers=headers)
         if limit is not None:
@@ -1620,11 +1799,11 @@ class HfApi:
         dataset_str = ""
 
         # Handling author
-        if dataset_filter.author is not None:
+        if dataset_filter.author:
             dataset_str = f"{dataset_filter.author}/"
 
         # Handling dataset_name
-        if dataset_filter.dataset_name is not None:
+        if dataset_filter.dataset_name:
             dataset_str += dataset_filter.dataset_name
 
         filter_list = []
@@ -2263,24 +2442,67 @@ class HfApi:
         Returns:
             True if the repository exists, False otherwise.
 
-        <Tip>
-
         Examples:
             ```py
             >>> from huggingface_hub import repo_exists
-            >>> repo_exists("huggingface/transformers")
+            >>> repo_exists("google/gemma-7b")
             True
-            >>> repo_exists("huggingface/not-a-repo")
+            >>> repo_exists("google/not-a-repo")
             False
             ```
-
-        </Tip>
         """
         try:
             self.repo_info(repo_id=repo_id, repo_type=repo_type, token=token)
             return True
         except GatedRepoError:
             return True  # we don't have access but it exists
+        except RepositoryNotFoundError:
+            return False
+
+    @validate_hf_hub_args
+    def revision_exists(
+        self,
+        repo_id: str,
+        revision: str,
+        *,
+        repo_type: Optional[str] = None,
+        token: Optional[str] = None,
+    ) -> bool:
+        """
+        Checks if a specific revision exists on a repo on the Hugging Face Hub.
+
+        Args:
+            repo_id (`str`):
+                A namespace (user or an organization) and a repo name separated
+                by a `/`.
+            revision (`str`):
+                The revision of the repository to check.
+            repo_type (`str`, *optional*):
+                Set to `"dataset"` or `"space"` if getting repository info from a dataset or a space,
+                `None` or `"model"` if getting repository info from a model. Default is `None`.
+            token (`bool` or `str`, *optional*):
+                A valid authentication token (see https://huggingface.co/settings/token).
+                If `None` or `True` and machine is logged in (through `huggingface-cli login`
+                or [`~huggingface_hub.login`]), token will be retrieved from the cache.
+                If `False`, token is not sent in the request header.
+
+        Returns:
+            True if the repository and the revision exists, False otherwise.
+
+        Examples:
+            ```py
+            >>> from huggingface_hub import revision_exists
+            >>> revision_exists("google/gemma-7b", "float16")
+            True
+            >>> revision_exists("google/gemma-7b", "not-a-revision")
+            False
+            ```
+        """
+        try:
+            self.repo_info(repo_id=repo_id, revision=revision, repo_type=repo_type, token=token)
+            return True
+        except RevisionNotFoundError:
+            return False
         except RepositoryNotFoundError:
             return False
 
@@ -2318,8 +2540,6 @@ class HfApi:
         Returns:
             True if the file exists, False otherwise.
 
-        <Tip>
-
         Examples:
             ```py
             >>> from huggingface_hub import file_exists
@@ -2330,8 +2550,6 @@ class HfApi:
             >>> file_exists("bigcode/not-a-repo", "config.json")
             False
             ```
-
-        </Tip>
         """
         url = hf_hub_url(
             repo_id=repo_id, repo_type=repo_type, revision=revision, filename=filename, endpoint=self.endpoint
@@ -2347,6 +2565,7 @@ class HfApi:
             return False
 
     @validate_hf_hub_args
+    @_deprecate_method(version="0.23", message="Use `list_repo_tree` and `get_paths_info` instead.")
     def list_files_info(
         self,
         repo_id: str,
@@ -2559,9 +2778,10 @@ class HfApi:
         """
         return [
             f.rfilename
-            for f in self.list_files_info(
-                repo_id=repo_id, paths=None, revision=revision, repo_type=repo_type, token=token
+            for f in self.list_repo_tree(
+                repo_id=repo_id, recursive=True, revision=revision, repo_type=repo_type, token=token
             )
+            if isinstance(f, RepoFile)
         ]
 
     @validate_hf_hub_args
@@ -3197,6 +3417,9 @@ class HfApi:
                 raise
 
     @validate_hf_hub_args
+    @_deprecate_arguments(
+        version="0.24.0", deprecated_args=("organization", "name"), custom_message="Use `repo_id` instead."
+    )
     def update_repo_visibility(
         self,
         repo_id: str,
@@ -3464,7 +3687,8 @@ class HfApi:
             [`ValueError`](https://docs.python.org/3/library/exceptions.html#ValueError)
                 If parent commit is not a valid commit OID.
             [`ValueError`](https://docs.python.org/3/library/exceptions.html#ValueError)
-                If the Hub API returns an HTTP 400 error (bad request)
+                If a README.md file with an invalid metadata section is committed. In this case, the commit will fail
+                early, before trying to upload any file.
             [`ValueError`](https://docs.python.org/3/library/exceptions.html#ValueError)
                 If `create_pr` is `True` and revision is neither `None` nor `"main"`.
             [`~utils.RepositoryNotFoundError`]:
@@ -3506,6 +3730,32 @@ class HfApi:
             f" {nb_deletions} deletion(s)."
         )
 
+        # If updating a README.md file, make sure the metadata format is valid
+        # It's better to fail early than to fail after all the files have been uploaded.
+        for addition in additions:
+            if addition.path_in_repo == "README.md":
+                with addition.as_file() as file:
+                    response = get_session().post(
+                        f"{ENDPOINT}/api/validate-yaml",
+                        json={"content": file.read().decode(), "repoType": repo_type},
+                        headers=self._build_hf_headers(token=token),
+                    )
+                    # Handle warnings (example: empty metadata)
+                    response_content = response.json()
+                    message = "\n".join(
+                        [f"- {warning.get('message')}" for warning in response_content.get("warnings", [])]
+                    )
+                    if message:
+                        warnings.warn(f"Warnings while validating metadata in README.md:\n{message}")
+
+                    # Raise on errors
+                    try:
+                        hf_raise_for_status(response)
+                    except BadRequestError as e:
+                        errors = response_content.get("errors", [])
+                        message = "\n".join([f"- {error.get('message')}" for error in errors])
+                        raise ValueError(f"Invalid metadata in README.md.\n{message}") from e
+
         # If updating twice the same file or update then delete a file in a single commit
         _warn_on_overwriting_operations(operations)
 
@@ -3519,7 +3769,7 @@ class HfApi:
             num_threads=num_threads,
             free_memory=False,  # do not remove `CommitOperationAdd.path_or_fileobj` on LFS files for "normal" users
         )
-        files_to_copy = _fetch_lfs_files_to_copy(
+        files_to_copy = _fetch_files_to_copy(
             copies=copies,
             repo_type=repo_type,
             repo_id=repo_id,
@@ -4041,7 +4291,7 @@ class HfApi:
         create_pr: Optional[bool] = None,
         parent_commit: Optional[str] = None,
         run_as_future: Literal[False] = ...,
-    ) -> str:
+    ) -> CommitInfo:
         ...
 
     @overload
@@ -4059,7 +4309,7 @@ class HfApi:
         create_pr: Optional[bool] = None,
         parent_commit: Optional[str] = None,
         run_as_future: Literal[True] = ...,
-    ) -> Future[str]:
+    ) -> Future[CommitInfo]:
         ...
 
     @validate_hf_hub_args
@@ -4078,7 +4328,7 @@ class HfApi:
         create_pr: Optional[bool] = None,
         parent_commit: Optional[str] = None,
         run_as_future: bool = False,
-    ) -> Union[str, Future[str]]:
+    ) -> Union[CommitInfo, Future[CommitInfo]]:
         """
         Upload a local file (up to 50 GB) to the given repo. The upload is done
         through a HTTP post request, and doesn't require git or git-lfs to be
@@ -4126,9 +4376,10 @@ class HfApi:
 
 
         Returns:
-            `str` or `Future`: The URL to visualize the uploaded file on the hub. If `run_as_future=True` is passed,
-            returns a Future object which will contain the result when executed.
-
+            [`CommitInfo`] or `Future`:
+                Instance of [`CommitInfo`] containing information about the newly created commit (commit hash, commit
+                url, pr url, commit message,...). If `run_as_future=True` is passed, returns a Future object which will
+                contain the result when executed.
         <Tip>
 
         Raises the following errors:
@@ -4215,8 +4466,17 @@ class HfApi:
         if repo_type in REPO_TYPES_URL_PREFIXES:
             repo_id = REPO_TYPES_URL_PREFIXES[repo_type] + repo_id
         revision = revision if revision is not None else DEFAULT_REVISION
-        # Similar to `hf_hub_url` but it's "blob" instead of "resolve"
-        return f"{self.endpoint}/{repo_id}/blob/{revision}/{path_in_repo}"
+
+        return CommitInfo(
+            commit_url=commit_info.commit_url,
+            commit_message=commit_info.commit_message,
+            commit_description=commit_info.commit_description,
+            oid=commit_info.oid,
+            pr_url=commit_info.pr_url,
+            # Similar to `hf_hub_url` but it's "blob" instead of "resolve"
+            # TODO: remove this in v1.0
+            _url=f"{self.endpoint}/{repo_id}/blob/{revision}/{path_in_repo}",
+        )
 
     @overload
     def upload_folder(  # type: ignore
@@ -4235,10 +4495,56 @@ class HfApi:
         allow_patterns: Optional[Union[List[str], str]] = None,
         ignore_patterns: Optional[Union[List[str], str]] = None,
         delete_patterns: Optional[Union[List[str], str]] = None,
-        multi_commits: bool = False,
+        multi_commits: Literal[False] = ...,
         multi_commits_verbose: bool = False,
         run_as_future: Literal[False] = ...,
-    ) -> str:
+    ) -> CommitInfo:
+        ...
+
+    @overload
+    def upload_folder(  # type: ignore
+        self,
+        *,
+        repo_id: str,
+        folder_path: Union[str, Path],
+        path_in_repo: Optional[str] = None,
+        commit_message: Optional[str] = None,
+        commit_description: Optional[str] = None,
+        token: Optional[str] = None,
+        repo_type: Optional[str] = None,
+        revision: Optional[str] = None,
+        create_pr: Optional[bool] = None,
+        parent_commit: Optional[str] = None,
+        allow_patterns: Optional[Union[List[str], str]] = None,
+        ignore_patterns: Optional[Union[List[str], str]] = None,
+        delete_patterns: Optional[Union[List[str], str]] = None,
+        multi_commits: Literal[True] = ...,
+        multi_commits_verbose: bool = False,
+        run_as_future: Literal[False] = ...,
+    ) -> str:  # Only the PR url in multi-commits mode
+        ...
+
+    @overload
+    def upload_folder(  # type: ignore
+        self,
+        *,
+        repo_id: str,
+        folder_path: Union[str, Path],
+        path_in_repo: Optional[str] = None,
+        commit_message: Optional[str] = None,
+        commit_description: Optional[str] = None,
+        token: Optional[str] = None,
+        repo_type: Optional[str] = None,
+        revision: Optional[str] = None,
+        create_pr: Optional[bool] = None,
+        parent_commit: Optional[str] = None,
+        allow_patterns: Optional[Union[List[str], str]] = None,
+        ignore_patterns: Optional[Union[List[str], str]] = None,
+        delete_patterns: Optional[Union[List[str], str]] = None,
+        multi_commits: Literal[False] = ...,
+        multi_commits_verbose: bool = False,
+        run_as_future: Literal[True] = ...,
+    ) -> Future[CommitInfo]:
         ...
 
     @overload
@@ -4258,10 +4564,10 @@ class HfApi:
         allow_patterns: Optional[Union[List[str], str]] = None,
         ignore_patterns: Optional[Union[List[str], str]] = None,
         delete_patterns: Optional[Union[List[str], str]] = None,
-        multi_commits: bool = False,
+        multi_commits: Literal[True] = ...,
         multi_commits_verbose: bool = False,
         run_as_future: Literal[True] = ...,
-    ) -> Future[str]:
+    ) -> Future[str]:  # Only the PR url in multi-commits mode
         ...
 
     @validate_hf_hub_args
@@ -4285,7 +4591,7 @@ class HfApi:
         multi_commits: bool = False,
         multi_commits_verbose: bool = False,
         run_as_future: bool = False,
-    ) -> Union[str, Future[str]]:
+    ) -> Union[CommitInfo, str, Future[CommitInfo], Future[str]]:
         """
         Upload a local folder to the given repo. The upload is done through a HTTP requests, and doesn't require git or
         git-lfs to be installed.
@@ -4362,8 +4668,13 @@ class HfApi:
                 object. Defaults to `False`.
 
         Returns:
-            `str` or `Future[str]`: A URL to visualize the uploaded folder on the hub. If `run_as_future=True` is passed,
-            returns a Future object which will contain the result when executed.
+            [`CommitInfo`] or `Future`:
+                Instance of [`CommitInfo`] containing information about the newly created commit (commit hash, commit
+                url, pr url, commit message,...). If `run_as_future=True` is passed, returns a Future object which will
+                contain the result when executed.
+            [`str`] or `Future`:
+                If `multi_commits=True`, returns the url of the PR created to push the changes. If `run_as_future=True`
+                is passed, returns a Future object which will contain the result when executed.
 
         <Tip>
 
@@ -4470,7 +4781,6 @@ class HfApi:
             ]
         commit_operations = delete_operations + add_operations
 
-        pr_url: Optional[str]
         commit_message = commit_message or "Upload folder using huggingface_hub"
         if multi_commits:
             addition_commits, deletion_commits = plan_multi_commits(operations=commit_operations)
@@ -4485,27 +4795,39 @@ class HfApi:
                 merge_pr=not create_pr,
                 verbose=multi_commits_verbose,
             )
-        else:
-            commit_info = self.create_commit(
-                repo_type=repo_type,
-                repo_id=repo_id,
-                operations=commit_operations,
-                commit_message=commit_message,
-                commit_description=commit_description,
-                token=token,
-                revision=revision,
-                create_pr=create_pr,
-                parent_commit=parent_commit,
-            )
-            pr_url = commit_info.pr_url
+            # Defining a CommitInfo object is not really relevant in this case
+            # Let's return early with pr_url only (as string).
+            return pr_url
 
-        if create_pr and pr_url is not None:
-            revision = quote(_parse_revision_from_pr_url(pr_url), safe="")
+        commit_info = self.create_commit(
+            repo_type=repo_type,
+            repo_id=repo_id,
+            operations=commit_operations,
+            commit_message=commit_message,
+            commit_description=commit_description,
+            token=token,
+            revision=revision,
+            create_pr=create_pr,
+            parent_commit=parent_commit,
+        )
+
+        # Create url to uploaded folder (for legacy return value)
+        if create_pr and commit_info.pr_url is not None:
+            revision = quote(_parse_revision_from_pr_url(commit_info.pr_url), safe="")
         if repo_type in REPO_TYPES_URL_PREFIXES:
             repo_id = REPO_TYPES_URL_PREFIXES[repo_type] + repo_id
         revision = revision if revision is not None else DEFAULT_REVISION
-        # Similar to `hf_hub_url` but it's "tree" instead of "resolve"
-        return f"{self.endpoint}/{repo_id}/tree/{revision}/{path_in_repo}"
+
+        return CommitInfo(
+            commit_url=commit_info.commit_url,
+            commit_message=commit_info.commit_message,
+            commit_description=commit_info.commit_description,
+            oid=commit_info.oid,
+            pr_url=commit_info.pr_url,
+            # Similar to `hf_hub_url` but it's "tree" instead of "resolve"
+            # TODO: remove this in v1.0
+            _url=f"{self.endpoint}/{repo_id}/tree/{revision}/{path_in_repo}",
+        )
 
     @validate_hf_hub_args
     def delete_file(
@@ -5027,7 +5349,7 @@ class HfApi:
         safetensors file, we parse the metadata from this file. If it's a sharded safetensors repo, we parse the
         metadata from the index file and then parse the metadata from each shard.
 
-        To parse metadata from a single safetensors file, use [`get_safetensors_metadata`].
+        To parse metadata from a single safetensors file, use [`parse_safetensors_file_metadata`].
 
         For more details regarding the safetensors format, check out https://huggingface.co/docs/safetensors/index#format.
 
@@ -5570,18 +5892,19 @@ class HfApi:
             raise ValueError(f"Invalid discussion_status, must be one of {DISCUSSION_STATUS}")
 
         headers = self._build_hf_headers(token=token)
-        query_dict: Dict[str, str] = {}
+        path = f"{self.endpoint}/api/{repo_type}s/{repo_id}/discussions"
+
+        params: Dict[str, Union[str, int]] = {}
         if discussion_type is not None:
-            query_dict["type"] = discussion_type
+            params["type"] = discussion_type
         if discussion_status is not None:
-            query_dict["status"] = discussion_status
+            params["status"] = discussion_status
         if author is not None:
-            query_dict["author"] = author
+            params["author"] = author
 
         def _fetch_discussion_page(page_index: int):
-            query_string = urlencode({**query_dict, "page_index": page_index})
-            path = f"{self.endpoint}/api/{repo_type}s/{repo_id}/discussions?{query_string}"
-            resp = get_session().get(path, headers=headers)
+            params["p"] = page_index
+            resp = get_session().get(path, headers=headers, params=params)
             hf_raise_for_status(resp)
             paginated_discussions = resp.json()
             total = paginated_discussions["count"]
@@ -7515,6 +7838,15 @@ class HfApi:
 
         Returns: [`Collection`]
 
+        Raises:
+            `HTTPError`:
+                HTTP 403 if you only have read-only access to the repo. This can be the case if you don't have `write`
+                or `admin` role in the organization the repo belongs to or if you passed a `read` token.
+            `HTTPError`:
+                HTTP 404 if the item you try to add to the collection does not exist on the Hub.
+            `HTTPError`:
+                HTTP 409 if the item you try to add to the collection is already in the collection (and exists_ok=False)
+
         Example:
 
         ```py
@@ -7655,6 +7987,406 @@ class HfApi:
             else:
                 raise
 
+    ##########################
+    # Manage access requests #
+    ##########################
+
+    @validate_hf_hub_args
+    def list_pending_access_requests(
+        self, repo_id: str, *, repo_type: Optional[str] = None, token: Optional[str] = None
+    ) -> List[AccessRequest]:
+        """
+        Get pending access requests for a given gated repo.
+
+        A pending request means the user has requested access to the repo but the request has not been processed yet.
+        If the approval mode is automatic, this list should be empty. Pending requests can be accepted or rejected
+        using [`accept_access_request`] and [`reject_access_request`].
+
+        For more info about gated repos, see https://huggingface.co/docs/hub/models-gated.
+
+        Args:
+            repo_id (`str`):
+                The id of the repo to get access requests for.
+            repo_type (`str`, *optional*):
+                The type of the repo to get access requests for. Must be one of `model`, `dataset` or `space`.
+                Defaults to `model`.
+            token (`str`, *optional*):
+                A valid authentication token (see https://huggingface.co/settings/token).
+
+        Returns:
+            `List[AccessRequest]`: A list of [`AccessRequest`] objects. Each time contains a `username`, `email`,
+            `status` and `timestamp` attribute. If the gated repo has a custom form, the `fields` attribute will
+            be populated with user's answers.
+
+        Raises:
+            `HTTPError`:
+                HTTP 400 if the repo is not gated.
+            `HTTPError`:
+                HTTP 403 if you only have read-only access to the repo. This can be the case if you don't have `write`
+                or `admin` role in the organization the repo belongs to or if you passed a `read` token.
+
+        Example:
+        ```py
+        >>> from huggingface_hub import list_pending_access_requests, accept_access_request
+
+        # List pending requests
+        >>> requests = list_pending_access_requests("meta-llama/Llama-2-7b")
+        >>> len(requests)
+        411
+        >>> requests[0]
+        [
+            AccessRequest(
+                username='clem',
+                fullname='Clem 🤗',
+                email='***',
+                timestamp=datetime.datetime(2023, 11, 23, 18, 4, 53, 828000, tzinfo=datetime.timezone.utc),
+                status='pending',
+                fields=None,
+            ),
+            ...
+        ]
+
+        # Accept Clem's request
+        >>> accept_access_request("meta-llama/Llama-2-7b", "clem")
+        ```
+        """
+        return self._list_access_requests(repo_id, "pending", repo_type=repo_type, token=token)
+
+    @validate_hf_hub_args
+    def list_accepted_access_requests(
+        self, repo_id: str, *, repo_type: Optional[str] = None, token: Optional[str] = None
+    ) -> List[AccessRequest]:
+        """
+        Get accepted access requests for a given gated repo.
+
+        An accepted request means the user has requested access to the repo and the request has been accepted. The user
+        can download any file of the repo. If the approval mode is automatic, this list should contains by default all
+        requests. Accepted requests can be cancelled or rejected at any time using [`cancel_access_request`] and
+        [`reject_access_request`]. A cancelled request will go back to the pending list while a rejected request will
+        go to the rejected list. In both cases, the user will lose access to the repo.
+
+        For more info about gated repos, see https://huggingface.co/docs/hub/models-gated.
+
+        Args:
+            repo_id (`str`):
+                The id of the repo to get access requests for.
+            repo_type (`str`, *optional*):
+                The type of the repo to get access requests for. Must be one of `model`, `dataset` or `space`.
+                Defaults to `model`.
+            token (`str`, *optional*):
+                A valid authentication token (see https://huggingface.co/settings/token).
+
+        Returns:
+            `List[AccessRequest]`: A list of [`AccessRequest`] objects. Each time contains a `username`, `email`,
+            `status` and `timestamp` attribute. If the gated repo has a custom form, the `fields` attribute will
+            be populated with user's answers.
+
+        Raises:
+            `HTTPError`:
+                HTTP 400 if the repo is not gated.
+            `HTTPError`:
+                HTTP 403 if you only have read-only access to the repo. This can be the case if you don't have `write`
+                or `admin` role in the organization the repo belongs to or if you passed a `read` token.
+
+        Example:
+        ```py
+        >>> from huggingface_hub import list_accepted_access_requests
+
+        >>> requests = list_accepted_access_requests("meta-llama/Llama-2-7b")
+        >>> len(requests)
+        411
+        >>> requests[0]
+        [
+            AccessRequest(
+                username='clem',
+                fullname='Clem 🤗',
+                email='***',
+                timestamp=datetime.datetime(2023, 11, 23, 18, 4, 53, 828000, tzinfo=datetime.timezone.utc),
+                status='accepted',
+                fields=None,
+            ),
+            ...
+        ]
+        ```
+        """
+        return self._list_access_requests(repo_id, "accepted", repo_type=repo_type, token=token)
+
+    @validate_hf_hub_args
+    def list_rejected_access_requests(
+        self, repo_id: str, *, repo_type: Optional[str] = None, token: Optional[str] = None
+    ) -> List[AccessRequest]:
+        """
+        Get rejected access requests for a given gated repo.
+
+        A rejected request means the user has requested access to the repo and the request has been explicitly rejected
+        by a repo owner (either you or another user from your organization). The user cannot download any file of the
+        repo. Rejected requests can be accepted or cancelled at any time using [`accept_access_request`] and
+        [`cancel_access_request`]. A cancelled request will go back to the pending list while an accepted request will
+        go to the accepted list.
+
+        For more info about gated repos, see https://huggingface.co/docs/hub/models-gated.
+
+        Args:
+            repo_id (`str`):
+                The id of the repo to get access requests for.
+            repo_type (`str`, *optional*):
+                The type of the repo to get access requests for. Must be one of `model`, `dataset` or `space`.
+                Defaults to `model`.
+            token (`str`, *optional*):
+                A valid authentication token (see https://huggingface.co/settings/token).
+
+        Returns:
+            `List[AccessRequest]`: A list of [`AccessRequest`] objects. Each time contains a `username`, `email`,
+            `status` and `timestamp` attribute. If the gated repo has a custom form, the `fields` attribute will
+            be populated with user's answers.
+
+        Raises:
+            `HTTPError`:
+                HTTP 400 if the repo is not gated.
+            `HTTPError`:
+                HTTP 403 if you only have read-only access to the repo. This can be the case if you don't have `write`
+                or `admin` role in the organization the repo belongs to or if you passed a `read` token.
+
+        Example:
+        ```py
+        >>> from huggingface_hub import list_rejected_access_requests
+
+        >>> requests = list_rejected_access_requests("meta-llama/Llama-2-7b")
+        >>> len(requests)
+        411
+        >>> requests[0]
+        [
+            AccessRequest(
+                username='clem',
+                fullname='Clem 🤗',
+                email='***',
+                timestamp=datetime.datetime(2023, 11, 23, 18, 4, 53, 828000, tzinfo=datetime.timezone.utc),
+                status='rejected',
+                fields=None,
+            ),
+            ...
+        ]
+        ```
+        """
+        return self._list_access_requests(repo_id, "rejected", repo_type=repo_type, token=token)
+
+    def _list_access_requests(
+        self,
+        repo_id: str,
+        status: Literal["accepted", "rejected", "pending"],
+        repo_type: Optional[str] = None,
+        token: Optional[str] = None,
+    ) -> List[AccessRequest]:
+        if repo_type not in REPO_TYPES:
+            raise ValueError(f"Invalid repo type, must be one of {REPO_TYPES}")
+        if repo_type is None:
+            repo_type = REPO_TYPE_MODEL
+
+        response = get_session().get(
+            f"{ENDPOINT}/api/{repo_type}s/{repo_id}/user-access-request/{status}",
+            headers=self._build_hf_headers(token=token),
+        )
+        hf_raise_for_status(response)
+        return [
+            AccessRequest(
+                username=request["user"]["user"],
+                fullname=request["user"]["fullname"],
+                email=request["user"]["email"],
+                status=request["status"],
+                timestamp=parse_datetime(request["timestamp"]),
+                fields=request.get("fields"),  # only if custom fields in form
+            )
+            for request in response.json()
+        ]
+
+    @validate_hf_hub_args
+    def cancel_access_request(
+        self, repo_id: str, user: str, *, repo_type: Optional[str] = None, token: Optional[str] = None
+    ) -> None:
+        """
+        Cancel an access request from a user for a given gated repo.
+
+        A cancelled request will go back to the pending list and the user will lose access to the repo.
+
+        For more info about gated repos, see https://huggingface.co/docs/hub/models-gated.
+
+        Args:
+            repo_id (`str`):
+                The id of the repo to cancel access request for.
+            user (`str`):
+                The username of the user which access request should be cancelled.
+            repo_type (`str`, *optional*):
+                The type of the repo to cancel access request for. Must be one of `model`, `dataset` or `space`.
+                Defaults to `model`.
+            token (`str`, *optional*):
+                A valid authentication token (see https://huggingface.co/settings/token).
+
+        Raises:
+            `HTTPError`:
+                HTTP 400 if the repo is not gated.
+            `HTTPError`:
+                HTTP 403 if you only have read-only access to the repo. This can be the case if you don't have `write`
+                or `admin` role in the organization the repo belongs to or if you passed a `read` token.
+            `HTTPError`:
+                HTTP 404 if the user does not exist on the Hub.
+            `HTTPError`:
+                HTTP 404 if the user access request cannot be found.
+            `HTTPError`:
+                HTTP 404 if the user access request is already in the pending list.
+        """
+        self._handle_access_request(repo_id, user, "pending", repo_type=repo_type, token=token)
+
+    @validate_hf_hub_args
+    def accept_access_request(
+        self, repo_id: str, user: str, *, repo_type: Optional[str] = None, token: Optional[str] = None
+    ) -> None:
+        """
+        Accept an access request from a user for a given gated repo.
+
+        Once the request is accepted, the user will be able to download any file of the repo and access the community
+        tab. If the approval mode is automatic, you don't have to accept requests manually. An accepted request can be
+        cancelled or rejected at any time using [`cancel_access_request`] and [`reject_access_request`].
+
+        For more info about gated repos, see https://huggingface.co/docs/hub/models-gated.
+
+        Args:
+            repo_id (`str`):
+                The id of the repo to accept access request for.
+            user (`str`):
+                The username of the user which access request should be accepted.
+            repo_type (`str`, *optional*):
+                The type of the repo to accept access request for. Must be one of `model`, `dataset` or `space`.
+                Defaults to `model`.
+            token (`str`, *optional*):
+                A valid authentication token (see https://huggingface.co/settings/token).
+
+        Raises:
+            `HTTPError`:
+                HTTP 400 if the repo is not gated.
+            `HTTPError`:
+                HTTP 403 if you only have read-only access to the repo. This can be the case if you don't have `write`
+                or `admin` role in the organization the repo belongs to or if you passed a `read` token.
+            `HTTPError`:
+                HTTP 404 if the user does not exist on the Hub.
+            `HTTPError`:
+                HTTP 404 if the user access request cannot be found.
+            `HTTPError`:
+                HTTP 404 if the user access request is already in the accepted list.
+        """
+        self._handle_access_request(repo_id, user, "accepted", repo_type=repo_type, token=token)
+
+    @validate_hf_hub_args
+    def reject_access_request(
+        self, repo_id: str, user: str, *, repo_type: Optional[str] = None, token: Optional[str] = None
+    ) -> None:
+        """
+        Reject an access request from a user for a given gated repo.
+
+        A rejected request will go to the rejected list. The user cannot download any file of the repo. Rejected
+        requests can be accepted or cancelled at any time using [`accept_access_request`] and [`cancel_access_request`].
+        A cancelled request will go back to the pending list while an accepted request will go to the accepted list.
+
+        For more info about gated repos, see https://huggingface.co/docs/hub/models-gated.
+
+        Args:
+            repo_id (`str`):
+                The id of the repo to reject access request for.
+            user (`str`):
+                The username of the user which access request should be rejected.
+            repo_type (`str`, *optional*):
+                The type of the repo to reject access request for. Must be one of `model`, `dataset` or `space`.
+                Defaults to `model`.
+            token (`str`, *optional*):
+                A valid authentication token (see https://huggingface.co/settings/token).
+
+        Raises:
+            `HTTPError`:
+                HTTP 400 if the repo is not gated.
+            `HTTPError`:
+                HTTP 403 if you only have read-only access to the repo. This can be the case if you don't have `write`
+                or `admin` role in the organization the repo belongs to or if you passed a `read` token.
+            `HTTPError`:
+                HTTP 404 if the user does not exist on the Hub.
+            `HTTPError`:
+                HTTP 404 if the user access request cannot be found.
+            `HTTPError`:
+                HTTP 404 if the user access request is already in the rejected list.
+        """
+        self._handle_access_request(repo_id, user, "rejected", repo_type=repo_type, token=token)
+
+    @validate_hf_hub_args
+    def _handle_access_request(
+        self,
+        repo_id: str,
+        user: str,
+        status: Literal["accepted", "rejected", "pending"],
+        repo_type: Optional[str] = None,
+        token: Optional[str] = None,
+    ) -> None:
+        if repo_type not in REPO_TYPES:
+            raise ValueError(f"Invalid repo type, must be one of {REPO_TYPES}")
+        if repo_type is None:
+            repo_type = REPO_TYPE_MODEL
+
+        response = get_session().post(
+            f"{ENDPOINT}/api/{repo_type}s/{repo_id}/user-access-request/handle",
+            headers=self._build_hf_headers(token=token),
+            json={"user": user, "status": status},
+        )
+        hf_raise_for_status(response)
+
+    @validate_hf_hub_args
+    def grant_access(
+        self, repo_id: str, user: str, *, repo_type: Optional[str] = None, token: Optional[str] = None
+    ) -> None:
+        """
+        Grant access to a user for a given gated repo.
+
+        Granting access don't require for the user to send an access request by themselves. The user is automatically
+        added to the accepted list meaning they can download the files You can revoke the granted access at any time
+        using [`cancel_access_request`] or [`reject_access_request`].
+
+        For more info about gated repos, see https://huggingface.co/docs/hub/models-gated.
+
+        Args:
+            repo_id (`str`):
+                The id of the repo to grant access to.
+            user (`str`):
+                The username of the user to grant access.
+            repo_type (`str`, *optional*):
+                The type of the repo to grant access to. Must be one of `model`, `dataset` or `space`.
+                Defaults to `model`.
+            token (`str`, *optional*):
+                A valid authentication token (see https://huggingface.co/settings/token).
+
+        Raises:
+            `HTTPError`:
+                HTTP 400 if the repo is not gated.
+            `HTTPError`:
+                HTTP 400 if the user already has access to the repo.
+            `HTTPError`:
+                HTTP 403 if you only have read-only access to the repo. This can be the case if you don't have `write`
+                or `admin` role in the organization the repo belongs to or if you passed a `read` token.
+            `HTTPError`:
+                HTTP 404 if the user does not exist on the Hub.
+        """
+        if repo_type not in REPO_TYPES:
+            raise ValueError(f"Invalid repo type, must be one of {REPO_TYPES}")
+        if repo_type is None:
+            repo_type = REPO_TYPE_MODEL
+
+        response = get_session().post(
+            f"{ENDPOINT}/api/models/{repo_id}/user-access-request/grant",
+            headers=self._build_hf_headers(token=token),
+            json={"user": user},
+        )
+        hf_raise_for_status(response)
+        return response.json()
+
+    #############
+    # Internals #
+    #############
+
     def _build_hf_headers(
         self,
         token: Optional[Union[bool, str]] = None,
@@ -7785,6 +8517,7 @@ list_spaces = api.list_spaces
 space_info = api.space_info
 
 repo_exists = api.repo_exists
+revision_exists = api.revision_exists
 file_exists = api.file_exists
 repo_info = api.repo_info
 list_repo_files = api.list_repo_files
@@ -7876,3 +8609,12 @@ add_collection_item = api.add_collection_item
 update_collection_item = api.update_collection_item
 delete_collection_item = api.delete_collection_item
 delete_collection_item = api.delete_collection_item
+
+# Access requests API
+list_pending_access_requests = api.list_pending_access_requests
+list_accepted_access_requests = api.list_accepted_access_requests
+list_rejected_access_requests = api.list_rejected_access_requests
+cancel_access_request = api.cancel_access_request
+accept_access_request = api.accept_access_request
+reject_access_request = api.reject_access_request
+grant_access = api.grant_access

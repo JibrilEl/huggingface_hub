@@ -95,6 +95,15 @@ class InferenceClientVCRTest(InferenceClientTest):
             self.assertIsInstance(item["score"], float)
             self.assertIsInstance(item["label"], str)
 
+    def test_audio_to_audio(self) -> None:
+        output = self.client.audio_to_audio(self.audio_file)
+        assert isinstance(output, list)
+        assert len(output) > 0
+        for item in output:
+            assert isinstance(item["label"], str)
+            assert isinstance(item["blob"], bytes)
+            assert item["content-type"] == "audio/flac"
+
     def test_automatic_speech_recognition(self) -> None:
         output = self.client.automatic_speech_recognition(self.audio_file)
         self.assertEqual(output, "A MAN SAID TO THE UNIVERSE SIR I EXIST")
@@ -544,10 +553,10 @@ class TestModelStatus(unittest.TestCase):
     def test_loaded_model(self) -> None:
         client = InferenceClient()
         model_status = client.get_model_status("bigscience/bloom")
-        self.assertTrue(model_status.loaded)
-        self.assertEqual(model_status.state, "Loaded")
-        self.assertEqual(model_status.compute_type, "gpu")
-        self.assertEqual(model_status.framework, "text-generation-inference")
+        assert model_status.loaded
+        assert model_status.state == "Loaded"
+        assert isinstance(model_status.compute_type, dict)  # e.g. {'gpu': {'gpu': 'a100', 'count': 8}}
+        assert model_status.framework == "text-generation-inference"
 
     def test_unknown_model(self) -> None:
         client = InferenceClient()

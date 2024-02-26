@@ -38,6 +38,7 @@ _CANDIDATES = {
     "pillow": {"Pillow"},
     "pydantic": {"pydantic"},
     "pydot": {"pydot"},
+    "safetensors": {"safetensors"},
     "tensorboard": {"tensorboardX"},
     "tensorflow": (
         "tensorflow",
@@ -69,7 +70,7 @@ def _get_version(package_name: str) -> str:
     return _package_versions.get(package_name, "N/A")
 
 
-def _is_available(package_name: str) -> bool:
+def is_package_available(package_name: str) -> bool:
     return _get_version(package_name) != "N/A"
 
 
@@ -85,7 +86,7 @@ def get_hf_hub_version() -> str:
 
 # aiohttp
 def is_aiohttp_available() -> bool:
-    return _is_available("aiohttp")
+    return is_package_available("aiohttp")
 
 
 def get_aiohttp_version() -> str:
@@ -94,7 +95,7 @@ def get_aiohttp_version() -> str:
 
 # FastAI
 def is_fastai_available() -> bool:
-    return _is_available("fastai")
+    return is_package_available("fastai")
 
 
 def get_fastai_version() -> str:
@@ -103,7 +104,7 @@ def get_fastai_version() -> str:
 
 # Fastcore
 def is_fastcore_available() -> bool:
-    return _is_available("fastcore")
+    return is_package_available("fastcore")
 
 
 def get_fastcore_version() -> str:
@@ -112,7 +113,7 @@ def get_fastcore_version() -> str:
 
 # FastAI
 def is_gradio_available() -> bool:
-    return _is_available("gradio")
+    return is_package_available("gradio")
 
 
 def get_gradio_version() -> str:
@@ -121,7 +122,7 @@ def get_gradio_version() -> str:
 
 # Graphviz
 def is_graphviz_available() -> bool:
-    return _is_available("graphviz")
+    return is_package_available("graphviz")
 
 
 def get_graphviz_version() -> str:
@@ -130,7 +131,7 @@ def get_graphviz_version() -> str:
 
 # hf_transfer
 def is_hf_transfer_available() -> bool:
-    return _is_available("hf_transfer")
+    return is_package_available("hf_transfer")
 
 
 def get_hf_transfer_version() -> str:
@@ -139,7 +140,7 @@ def get_hf_transfer_version() -> str:
 
 # Numpy
 def is_numpy_available() -> bool:
-    return _is_available("numpy")
+    return is_package_available("numpy")
 
 
 def get_numpy_version() -> str:
@@ -148,7 +149,7 @@ def get_numpy_version() -> str:
 
 # Jinja
 def is_jinja_available() -> bool:
-    return _is_available("jinja")
+    return is_package_available("jinja")
 
 
 def get_jinja_version() -> str:
@@ -157,7 +158,7 @@ def get_jinja_version() -> str:
 
 # Pillow
 def is_pillow_available() -> bool:
-    return _is_available("pillow")
+    return is_package_available("pillow")
 
 
 def get_pillow_version() -> str:
@@ -166,7 +167,7 @@ def get_pillow_version() -> str:
 
 # Pydantic
 def is_pydantic_available() -> bool:
-    if not _is_available("pydantic"):
+    if not is_package_available("pydantic"):
         return False
     # For Pydantic, we add an extra check to test whether it is correctly installed or not. If both pydantic 2.x and
     # typing_extensions<=4.5.0 are installed, then pydantic will fail at import time. This should not happen when
@@ -195,7 +196,7 @@ def get_pydantic_version() -> str:
 
 # Pydot
 def is_pydot_available() -> bool:
-    return _is_available("pydot")
+    return is_package_available("pydot")
 
 
 def get_pydot_version() -> str:
@@ -204,7 +205,7 @@ def get_pydot_version() -> str:
 
 # Tensorboard
 def is_tensorboard_available() -> bool:
-    return _is_available("tensorboard")
+    return is_package_available("tensorboard")
 
 
 def get_tensorboard_version() -> str:
@@ -213,7 +214,7 @@ def get_tensorboard_version() -> str:
 
 # Tensorflow
 def is_tf_available() -> bool:
-    return _is_available("tensorflow")
+    return is_package_available("tensorflow")
 
 
 def get_tf_version() -> str:
@@ -222,11 +223,16 @@ def get_tf_version() -> str:
 
 # Torch
 def is_torch_available() -> bool:
-    return _is_available("torch")
+    return is_package_available("torch")
 
 
 def get_torch_version() -> str:
     return _get_version("torch")
+
+
+# Safetensors
+def is_safetensors_available() -> bool:
+    return is_package_available("safetensors")
 
 
 # Shell-related helpers
@@ -273,10 +279,10 @@ def dump_environment_info() -> Dict[str, Any]:
     - `diffusers` (https://github.com/huggingface/diffusers/blob/main/src/diffusers/commands/env.py)
     - `transformers` (https://github.com/huggingface/transformers/blob/main/src/transformers/commands/env.py)
     """
-    from huggingface_hub import HfFolder, whoami
+    from huggingface_hub import get_token, whoami
     from huggingface_hub.utils import list_credential_helpers
 
-    token = HfFolder().get_token()
+    token = get_token()
 
     # Generic machine info
     info: Dict[str, Any] = {
@@ -296,7 +302,7 @@ def dump_environment_info() -> Dict[str, Any]:
     info["Running in Google Colab ?"] = "Yes" if is_google_colab() else "No"
 
     # Login info
-    info["Token path ?"] = HfFolder().path_token
+    info["Token path ?"] = constants.HF_TOKEN_PATH
     info["Has saved token ?"] = token is not None
     if token is not None:
         try:

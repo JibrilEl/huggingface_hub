@@ -1,3 +1,15 @@
+- title: "Introduction"
+  sections:
+    - local: index
+      title: Home
+    - local: quick-start
+      title: Démarrage rapide
+    - local: installation
+      title: Installation
+- title: "Concepts"
+  sections:
+    - local: concepts/git_vs_http
+      title: Git ou HTTP?
 - title: "Get started"
   sections:
     - local: index

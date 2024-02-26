@@ -19,6 +19,7 @@
 # To re-generate the code, run `make style` or `python ./utils/generate_async_inference_client.py --update`.
 # WARNING
 import asyncio
+import base64
 import logging
 import time
 import warnings
@@ -63,6 +64,7 @@ from huggingface_hub.inference._text_generation import (
     raise_text_generation_error,
 )
 from huggingface_hub.inference._types import (
+    AudioToAudioOutput,
     ClassificationOutput,
     ConversationalOutput,
     FillMaskOutput,
@@ -294,6 +296,50 @@ class AsyncInferenceClient:
         """
         response = await self.post(data=audio, model=model, task="audio-classification")
         return _bytes_to_list(response)
+
+    async def audio_to_audio(
+        self,
+        audio: ContentT,
+        *,
+        model: Optional[str] = None,
+    ) -> List[AudioToAudioOutput]:
+        """
+        Performs multiple tasks related to audio-to-audio depending on the model (eg: speech enhancement, source separation).
+
+        Args:
+            audio (Union[str, Path, bytes, BinaryIO]):
+                The audio content for the model. It can be raw audio bytes, a local audio file, or a URL pointing to an
+                audio file.
+            model (`str`, *optional*):
+                The model can be any model which takes an audio file and returns another audio file. Can be a model ID hosted on the Hugging Face Hub
+                or a URL to a deployed Inference Endpoint. If not provided, the default recommended model for
+                audio_to_audio will be used.
+
+        Returns:
+            `List[Dict]`: A list of dictionary where each index contains audios label, content-type, and audio content in blob.
+
+        Raises:
+            `InferenceTimeoutError`:
+                If the model is unavailable or the request times out.
+            `aiohttp.ClientResponseError`:
+                If the request fails with an HTTP error status code other than HTTP 503.
+
+        Example:
+        ```py
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> audio_output = await client.audio_to_audio("audio.flac")
+        >>> async for i, item in enumerate(audio_output):
+        >>>     with open(f"output_{i}.flac", "wb") as f:
+                    f.write(item["blob"])
+        ```
+        """
+        response = await self.post(data=audio, model=model, task="audio-to-audio")
+        audio_output = _bytes_to_list(response)
+        for item in audio_output:
+            item["blob"] = base64.b64decode(item["blob"])
+        return audio_output
 
     async def automatic_speech_recognition(
         self,
@@ -1080,16 +1126,17 @@ class AsyncInferenceClient:
         )
         return _bytes_to_dict(response)  # type: ignore
 
-    async def tabular_classification(self, table: Dict[str, Any], *, model: str) -> List[str]:
+    async def tabular_classification(self, table: Dict[str, Any], *, model: Optional[str] = None) -> List[str]:
         """
         Classifying a target category (a group) based on a set of attributes.
 
         Args:
             table (`Dict[str, Any]`):
                 Set of attributes to classify.
-            model (`str`):
-                The model to use for the tabular-classification task. Can be a model ID hosted on the Hugging Face Hub or a URL to
-                a deployed Inference Endpoint.
+            model (`str`, *optional*):
+                The model to use for the tabular classification task. Can be a model ID hosted on the Hugging Face Hub or a URL to
+                a deployed Inference Endpoint. If not provided, the default recommended tabular classification model will be used.
+                Defaults to None.
 
         Returns:
             `List`: a list of labels, one per row in the initial table.
@@ -1125,16 +1172,17 @@ class AsyncInferenceClient:
         response = await self.post(json={"table": table}, model=model, task="tabular-classification")
         return _bytes_to_list(response)
 
-    async def tabular_regression(self, table: Dict[str, Any], *, model: str) -> List[float]:
+    async def tabular_regression(self, table: Dict[str, Any], *, model: Optional[str] = None) -> List[float]:
         """
         Predicting a numerical target value given a set of attributes/features in a table.
 
         Args:
             table (`Dict[str, Any]`):
                 Set of attributes stored in a table. The attributes used to predict the target can be both numerical and categorical.
-            model (`str`):
-                The model to use for the tabular-regression task. Can be a model ID hosted on the Hugging Face Hub or a URL to
-                a deployed Inference Endpoint.
+            model (`str`, *optional*):
+                The model to use for the tabular regression task. Can be a model ID hosted on the Hugging Face Hub or a URL to
+                a deployed Inference Endpoint. If not provided, the default recommended tabular regression model will be used.
+                Defaults to None.
 
         Returns:
             `List`: a list of predicted numerical target values.
@@ -1504,7 +1552,7 @@ class AsyncInferenceClient:
         # Remove some parameters if not a TGI server
         if not _is_tgi_server(model):
             ignored_parameters = []
-            for key in "watermark", "stop", "details", "decoder_input_details":
+            for key in "watermark", "stop", "details", "decoder_input_details", "best_of":
                 if payload["parameters"][key] is not None:
                     ignored_parameters.append(key)
                 del payload["parameters"][key]
